@@ -170,6 +170,7 @@ struct PoolInternals<C> {
     num_conns: u32,
     pending_conns: u32,
     last_error: Option<String>,
+    last_add_conn: Instant,
 }
 
 struct SharedPool<M>
@@ -184,14 +185,13 @@ where
 
 fn drop_conns<M>(
     shared: &Arc<SharedPool<M>>,
-    mut internals: MutexGuard<PoolInternals<M::Connection>>,
+    internals: &mut MutexGuard<PoolInternals<M::Connection>>,
     conns: Vec<Conn<M::Connection>>,
 ) where
     M: ManageConnection,
 {
+    log::debug!("r2d2: drop_conns: {} {:?}", conns.len(), shared.config.name);
     internals.num_conns -= conns.len() as u32;
-    establish_idle_connections(shared, &mut internals);
-    drop(internals); // make sure we run connection destructors without this locked
 
     for conn in conns {
         let event = ReleaseEvent {
@@ -201,6 +201,8 @@ fn drop_conns<M>(
         shared.config.event_handler.handle_release(event);
         shared.config.connection_customizer.on_release(conn.conn);
     }
+
+    establish_idle_connections(shared, internals);
 }
 
 fn establish_idle_connections<M>(
@@ -211,19 +213,50 @@ fn establish_idle_connections<M>(
 {
     let min = shared.config.min_idle.unwrap_or(shared.config.max_size);
     let idle = internals.conns.len() as u32;
+    log::debug!(
+        "r2d2: establish_idle_connections {:?} {:?}",
+        idle..min,
+        shared.config.name
+    );
     for _ in idle..min {
-        add_connection(shared, internals);
+        add_connection(shared, internals, false);
     }
 }
 
-fn add_connection<M>(shared: &Arc<SharedPool<M>>, internals: &mut PoolInternals<M::Connection>)
-where
+fn add_connection<M>(
+    shared: &Arc<SharedPool<M>>,
+    internals: &mut PoolInternals<M::Connection>,
+    force: bool,
+) where
     M: ManageConnection,
 {
     if internals.num_conns + internals.pending_conns >= shared.config.max_size {
         return;
     }
 
+    if let Some(duration) = shared.config.new_connection_duration {
+        let t = internals.last_add_conn.elapsed();
+        if !force && t < duration {
+            log::debug!(
+                "last_add_conn < duration, {}, {}, {:?}",
+                t.as_millis(),
+                duration.as_millis(),
+                shared.config.name
+            );
+            return;
+        } else {
+            log::debug!(
+                "last_add_conn > duration, {}, {}, {:?}",
+                t.as_millis(),
+                duration.as_millis(),
+                shared.config.name
+            );
+        }
+    } else {
+        log::warn!("new_connection_duration not set {:?}", shared.config.name);
+    }
+
+    internals.last_add_conn = Instant::now();
     internals.pending_conns += 1;
     inner(Duration::from_secs(0), shared);
 
@@ -299,6 +332,12 @@ where
     for conn in old {
         let mut reap = false;
         if let Some(timeout) = shared.config.idle_timeout {
+            log::debug!(
+                "{:?} {:?} {:?}",
+                shared.config.name,
+                (now - conn.idle_start).as_millis(),
+                timeout.as_millis()
+            );
             reap |= now - conn.idle_start >= timeout;
         }
         if let Some(lifetime) = shared.config.max_lifetime {
@@ -310,7 +349,7 @@ where
             internals.conns.push(conn);
         }
     }
-    drop_conns(&shared, internals, to_drop);
+    drop_conns(&shared, &mut internals, to_drop);
 }
 
 /// A generic connection pool.
@@ -366,6 +405,7 @@ where
             num_conns: 0,
             pending_conns: 0,
             last_error: None,
+            last_add_conn: Instant::now(),
         };
 
         let shared = Arc::new(SharedPool {
@@ -433,7 +473,16 @@ where
                 Err(i) => internals = i,
             }
 
-            add_connection(&self.0, &mut internals);
+            if !self
+                .0
+                .cond
+                .wait_until(&mut internals, start + Duration::from_secs(1))
+                .timed_out()
+            {
+                continue;
+            }
+
+            add_connection(&self.0, &mut internals, false);
 
             if self.0.cond.wait_until(&mut internals, end).timed_out() {
                 let event = TimeoutEvent { timeout };
@@ -466,11 +515,9 @@ where
                     if let Err(e) = self.0.manager.is_valid(&mut conn.conn.conn) {
                         let msg = e.to_string();
                         self.0.config.error_handler.handle_error(e);
-                        // FIXME we shouldn't have to lock, unlock, and relock here
                         internals = self.0.internals.lock();
                         internals.last_error = Some(msg);
-                        drop_conns(&self.0, internals, vec![conn.conn]);
-                        internals = self.0.internals.lock();
+                        drop_conns(&self.0, &mut internals, vec![conn.conn]);
                         continue;
                     }
                 }
@@ -490,6 +537,7 @@ where
         let event = CheckinEvent {
             id: conn.id,
             duration: checkout.elapsed(),
+            name: self.0.config.name.clone(),
         };
         self.0.config.event_handler.handle_checkin(event);
 
@@ -498,7 +546,7 @@ where
 
         let mut internals = self.0.internals.lock();
         if broken {
-            drop_conns(&self.0, internals, vec![conn]);
+            drop_conns(&self.0, &mut internals, vec![conn]);
         } else {
             let conn = IdleConn {
                 conn,

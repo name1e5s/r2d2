@@ -20,11 +20,13 @@ where
     max_lifetime: Option<Duration>,
     idle_timeout: Option<Duration>,
     connection_timeout: Duration,
+    new_connection_duration: Option<Duration>,
     error_handler: Box<dyn HandleError<M::Error>>,
     connection_customizer: Box<dyn CustomizeConnection<M::Connection, M::Error>>,
     event_handler: Box<dyn HandleEvent>,
     thread_pool: Option<Arc<ScheduledThreadPool>>,
     reaper_rate: Duration,
+    name: Option<String>,
     _p: PhantomData<M>,
 }
 
@@ -59,11 +61,13 @@ where
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(30 * 60)),
             connection_timeout: Duration::from_secs(30),
+            new_connection_duration: None,
             error_handler: Box::new(LoggingErrorHandler),
             event_handler: Box::new(NopEventHandler),
             connection_customizer: Box::new(NopConnectionCustomizer),
             thread_pool: None,
             reaper_rate: Duration::from_secs(30),
+            name: None,
             _p: PhantomData,
         }
     }
@@ -184,6 +188,20 @@ where
         self
     }
 
+    /// Sets the new_connection_duration used by the pool.
+    pub fn new_connection_duration(
+        mut self,
+        new_connection_duration: Option<Duration>,
+    ) -> Builder<M> {
+        assert_ne!(
+            new_connection_duration,
+            Some(Duration::from_secs(0)),
+            "new_connection_duration must be positive"
+        );
+        self.new_connection_duration = new_connection_duration;
+        self
+    }
+
     /// Sets the handler for errors reported in the pool.
     ///
     /// Defaults to the `LoggingErrorHandler`.
@@ -215,6 +233,12 @@ where
     #[allow(dead_code)]
     pub(crate) fn reaper_rate(mut self, reaper_rate: Duration) -> Builder<M> {
         self.reaper_rate = reaper_rate;
+        self
+    }
+
+    /// aa
+    pub fn name(mut self, name: String) -> Builder<M> {
+        self.name = Some(name);
         self
     }
 
@@ -260,14 +284,16 @@ where
 
         let config = Config {
             max_size: self.max_size,
-            min_idle: self.min_idle,
+            min_idle: Some(0),
             test_on_check_out: self.test_on_check_out,
             max_lifetime: self.max_lifetime,
             idle_timeout: self.idle_timeout,
             connection_timeout: self.connection_timeout,
+            new_connection_duration: self.new_connection_duration,
             error_handler: self.error_handler,
             event_handler: self.event_handler,
             connection_customizer: self.connection_customizer,
+            name: self.name,
             thread_pool,
         };
 
@@ -282,10 +308,12 @@ pub struct Config<C, E> {
     pub max_lifetime: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub connection_timeout: Duration,
+    pub new_connection_duration: Option<Duration>,
     pub error_handler: Box<dyn HandleError<E>>,
     pub event_handler: Box<dyn HandleEvent>,
     pub connection_customizer: Box<dyn CustomizeConnection<C, E>>,
     pub thread_pool: Arc<ScheduledThreadPool>,
+    pub name: Option<String>,
 }
 
 // manual to avoid bounds on C and E
@@ -301,6 +329,7 @@ impl<C, E> fmt::Debug for Config<C, E> {
             .field("error_handler", &self.error_handler)
             .field("event_handler", &self.event_handler)
             .field("connection_customizer", &self.connection_customizer)
+            .field("new_connection_duration", &self.new_connection_duration)
             .finish()
     }
 }

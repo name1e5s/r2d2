@@ -115,6 +115,7 @@ impl TimeoutEvent {
 pub struct CheckinEvent {
     pub(crate) id: u64,
     pub(crate) duration: Duration,
+    pub(crate) name: Option<String>,
 }
 
 impl CheckinEvent {
@@ -128,5 +129,9 @@ impl CheckinEvent {
     #[inline]
     pub fn duration(&self) -> Duration {
         self.duration
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
